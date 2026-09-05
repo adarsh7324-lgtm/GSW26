@@ -713,12 +713,24 @@ a {
   transform: scaleX(1);
 }
 
+/* Three.js 3D garment canvas — sits above the video, below the 2D debug overlay */
+.tryon-three-canvas {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+  z-index: 2;
+}
+
+/* 2D debug / skeleton overlay — always on top of the 3D garment */
 .tryon-canvas {
   position: absolute;
   inset: 0;
   width: 100%;
   height: 100%;
   pointer-events: none;
+  z-index: 3;
 }
 
 /* Pose Tracking Alignment HUD */

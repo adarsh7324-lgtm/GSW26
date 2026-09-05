@@ -3,6 +3,7 @@ import { useApp } from '../context/AppContext';
 import { CameraManager } from '../modules/CameraManager';
 import { PoseTracker } from '../modules/PoseTracker';
 import { GarmentRenderer } from '../modules/GarmentRenderer';
+import { GarmentManager } from '../modules/GarmentManager';
 import { GarmentLibrary } from './GarmentLibrary';
 import { GarmentUploader } from './GarmentUploader';
 import { LayerPanel } from './LayerPanel';
@@ -27,6 +28,13 @@ const MODEL = {
   ERROR:   'error',
 };
 
+const GLB_STATUS = {
+  IDLE:    'idle',
+  LOADING: 'loading',
+  READY:   'ready',
+  ERROR:   'error',
+};
+
 // ─── Component ─────────────────────────────────────────────────────────────
 
 export const TryOnCanvas = () => {
@@ -38,14 +46,16 @@ export const TryOnCanvas = () => {
   } = useApp();
 
   // DOM refs
-  const videoRef  = useRef(null);
-  const canvasRef = useRef(null);
-  const rafRef    = useRef(null);
+  const videoRef      = useRef(null);
+  const canvasRef     = useRef(null);   // 2D overlay canvas (skeleton, debug)
+  const threeCanvasRef = useRef(null);  // Three.js canvas (3D GLB garment)
+  const rafRef        = useRef(null);
 
   // Module singletons
-  const cameraRef   = useRef(null);
-  const trackerRef  = useRef(null);
-  const rendererRef = useRef(null);
+  const cameraRef        = useRef(null);
+  const trackerRef       = useRef(null);
+  const rendererRef      = useRef(null); // 2D GarmentRenderer
+  const garmentMgrRef    = useRef(null); // Three.js GarmentManager
 
   if (!cameraRef.current)   cameraRef.current   = new CameraManager();
   if (!trackerRef.current)  trackerRef.current   = new PoseTracker();
@@ -63,10 +73,14 @@ export const TryOnCanvas = () => {
   const [isPoseDetected,    setIsPoseDetected]    = useState(false);
   const [isSkeletonVisible, setIsSkeletonVisible] = useState(true);
   const [isOcclusionOn,     setIsOcclusionOn]     = useState(true);
-  const [isOutlineVisible,  setIsOutlineVisible]  = useState(true);  // tracking outline on by default
+  const [isOutlineVisible,  setIsOutlineVisible]  = useState(true);
   const [isDebugVisible,    setIsDebugVisible]    = useState(false);
   const [isLayerPanelOpen,  setIsLayerPanelOpen]  = useState(false);
   const [isUploaderOpen,    setIsUploaderOpen]    = useState(false);
+
+  // 3D garment state
+  const [selectedGarment, setSelectedGarment] = useState(null); // null | 'tshirt'
+  const [glbStatus,       setGlbStatus]       = useState(GLB_STATUS.IDLE);
 
   // Debug metrics (refs to avoid re-renders)
   const debugRef   = useRef({ fps: 0, confidence: 0, landmarks: 0, trackingState: 'SEARCHING' });
@@ -90,6 +104,7 @@ export const TryOnCanvas = () => {
     setCamStatus(CAM.REQUESTING);
     setCamError('');
     trackerRef.current.resetSmoothing();
+    garmentMgrRef.current?.reset();
 
     const res = await cameraRef.current.startCamera(videoRef.current, m);
     if (res.success) {
@@ -112,7 +127,7 @@ export const TryOnCanvas = () => {
   // ── Enable camera handler (button tap) ────────────────────────────────
 
   const handleEnable = useCallback(() => {
-    loadModel();          // start loading model in parallel
+    loadModel();
     startCamera(facingMode);
   }, [loadModel, startCamera, facingMode]);
 
@@ -124,7 +139,7 @@ export const TryOnCanvas = () => {
     await startCamera(next);
   }, [facingMode, startCamera]);
 
-  // ── Cleanup on close ───────────────────────────────────────────────────
+  // ── Cleanup on modal close ─────────────────────────────────────────────
 
   useEffect(() => {
     if (!isTryOnOpen) {
@@ -133,10 +148,57 @@ export const TryOnCanvas = () => {
       setCamStatus(CAM.IDLE);
       setIsPoseDetected(false);
       poseDetRef.current = false;
+      garmentMgrRef.current?.setVisible(false);
     }
   }, [isTryOnOpen]);
 
-  // ── Render loop ────────────────────────────────────────────────────────
+  // ── Three.js GarmentManager lifecycle ─────────────────────────────────
+  // Create when camera goes active, dispose on cleanup.
+  // The Three.js canvas must exist (threeCanvasRef.current) at this point.
+
+  useEffect(() => {
+    if (!isTryOnOpen || camStatus !== CAM.ACTIVE || !threeCanvasRef.current) return;
+
+    const gm = new GarmentManager(threeCanvasRef.current);
+    garmentMgrRef.current = gm;
+    console.log('[TryOnCanvas] GarmentManager created');
+
+    return () => {
+      console.log('[TryOnCanvas] GarmentManager disposed');
+      gm.dispose();
+      garmentMgrRef.current = null;
+    };
+  }, [isTryOnOpen, camStatus]);
+
+  // ── GLB load / unload when selectedGarment changes ───────────────────
+  // Also fires when camStatus changes (so GLB loads after GarmentManager init).
+
+  useEffect(() => {
+    const gm = garmentMgrRef.current;
+    if (!gm) return;
+
+    if (selectedGarment === 'tshirt') {
+      setGlbStatus(GLB_STATUS.LOADING);
+      gm.loadGarment('/models/t_shirt.glb')
+        .then(() => {
+          setGlbStatus(GLB_STATUS.READY);
+          gm.setVisible(true);
+          console.log('[TryOnCanvas] t_shirt.glb ready — garment visible');
+        })
+        .catch((err) => {
+          console.error('[TryOnCanvas] GLB load failed:', err);
+          setGlbStatus(GLB_STATUS.ERROR);
+        });
+    } else {
+      gm.setVisible(false);
+      setGlbStatus(GLB_STATUS.IDLE);
+    }
+  // garmentMgrRef is a ref, not state — we include camStatus so this
+  // re-fires after the GarmentManager init effect has run.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedGarment, camStatus, isTryOnOpen]);
+
+  // ── Main render loop ───────────────────────────────────────────────────
 
   useEffect(() => {
     if (!isTryOnOpen || camStatus !== CAM.ACTIVE) return;
@@ -146,7 +208,7 @@ export const TryOnCanvas = () => {
     const tracker  = trackerRef.current;
     const renderer = rendererRef.current;
 
-    // Configure renderer flags
+    // Configure 2D renderer flags
     renderer.showSkeleton        = isSkeletonVisible;
     renderer.showOcclusion       = isOcclusionOn;
     renderer.showTrackingOutline = isOutlineVisible;
@@ -154,7 +216,7 @@ export const TryOnCanvas = () => {
     const loop = (ts) => {
       if (!canvas) { rafRef.current = requestAnimationFrame(loop); return; }
 
-      // Resize canvas to CSS size
+      // Resize 2D canvas to CSS size
       const cw = canvas.clientWidth;
       const ch = canvas.clientHeight;
       if (canvas.width !== cw || canvas.height !== ch) {
@@ -165,7 +227,7 @@ export const TryOnCanvas = () => {
       const ctx = canvas.getContext('2d');
       ctx.clearRect(0, 0, cw, ch);
 
-      // Pose detection
+      // Pose detection (existing MediaPipe system — UNTOUCHED)
       const pose = tracker.detectPose(video, cw, ch, ts);
       const detected = !!(pose?.detected);
 
@@ -174,7 +236,10 @@ export const TryOnCanvas = () => {
         setIsPoseDetected(detected);
       }
 
-      // Render
+      // ── Three.js GLB update (every frame, including pose-loss frames) ──
+      garmentMgrRef.current?.update(pose, cw, ch);
+
+      // ── 2D skeleton / debug overlay ───────────────────────────────────
       if (pose?.detected) {
         renderer.render(ctx, pose, tryOnGarments, selectedColor, cw, ch);
       }
@@ -209,6 +274,19 @@ export const TryOnCanvas = () => {
   if (!isTryOnOpen) return null;
 
   const isLive = camStatus === CAM.ACTIVE;
+
+  // ── Garment selector helpers ───────────────────────────────────────────
+
+  const toggleTshirt = () => {
+    setSelectedGarment(prev => prev === 'tshirt' ? null : 'tshirt');
+  };
+
+  const glbStatusLabel = () => {
+    if (selectedGarment !== 'tshirt') return null;
+    if (glbStatus === GLB_STATUS.LOADING) return '⏳ Loading 3D shirt…';
+    if (glbStatus === GLB_STATUS.ERROR)   return '⚠ GLB load failed';
+    return null;
+  };
 
   // ── Render ─────────────────────────────────────────────────────────────
 
@@ -253,12 +331,18 @@ export const TryOnCanvas = () => {
       {/* ── Camera viewport ───────────────────────────────────────────── */}
       <div className="tryon-camera-viewport">
 
-        {/* Video feed */}
+        {/* Video feed — mirrored via CSS for front camera */}
         <video
           ref={videoRef}
           playsInline muted autoPlay
           className={`tryon-video${facingMode !== 'user' ? ' rear' : ''}`}
         />
+
+        {/* Three.js canvas — transparent, 3D GLB garment rendered here.
+            Sits above video but below the 2D debug overlay. */}
+        <canvas ref={threeCanvasRef} className="tryon-three-canvas" />
+
+        {/* 2D overlay canvas — skeleton, tracking outline, debug HUD */}
         <canvas ref={canvasRef} className="tryon-canvas" />
 
         {/* Permission gate */}
@@ -305,11 +389,19 @@ export const TryOnCanvas = () => {
           </div>
         )}
 
-        {/* Model loading pill */}
+        {/* Pose model loading pill */}
         {isLive && modelStatus === MODEL.LOADING && (
           <div className="model-loading-pill">
             <Loader size={13} className="spin-icon" />
             Loading pose model…
+          </div>
+        )}
+
+        {/* GLB loading pill */}
+        {isLive && glbStatusLabel() && (
+          <div className="model-loading-pill" style={{ top: '54px' }}>
+            <Loader size={13} className="spin-icon" />
+            {glbStatusLabel()}
           </div>
         )}
 
@@ -345,6 +437,15 @@ export const TryOnCanvas = () => {
             <div>State: <b style={{ color: debugSnap.trackingState === 'TRACKING' ? '#A3E635' : debugSnap.trackingState === 'TEMPORARILY_LOST' ? '#FBBF24' : '#F87171' }}>{debugSnap.trackingState ?? 'SEARCHING'}</b></div>
             <div>Layers: <b>{tryOnGarments.length}</b></div>
             <div>Occlusion: <b style={{ color: isOcclusionOn ? '#A3E635' : '#F87171' }}>{isOcclusionOn ? 'ON' : 'OFF'}</b></div>
+            <div style={{ marginTop: '4px', borderTop: '1px solid rgba(255,255,255,0.1)', paddingTop: '4px' }}>
+              <b style={{ color: '#60A5FA' }}>3D GARMENT</b>
+            </div>
+            <div>Type: <b style={{ color: '#fff' }}>{selectedGarment ?? '—'}</b></div>
+            <div>GLB: <b style={{
+              color: glbStatus === GLB_STATUS.READY ? '#A3E635'
+                   : glbStatus === GLB_STATUS.LOADING ? '#FBBF24'
+                   : glbStatus === GLB_STATUS.ERROR ? '#F87171' : '#888'
+            }}>{glbStatus}</b></div>
           </div>
         )}
 
@@ -378,9 +479,32 @@ export const TryOnCanvas = () => {
               className={`control-circle-btn${isOutlineVisible ? ' occlusion-active' : ''}`}
               onClick={() => setIsOutlineVisible(v => !v)}
               title="Toggle Tracking Outline"
-              style={{ fontSize: '1.1rem' }}
             >
               <span style={{ fontSize: '1.1rem', lineHeight: 1 }}>🎯</span>
+            </button>
+
+            {/* ── 3D Garment selector ─────────────────────────────────── */}
+            <button
+              className={`control-circle-btn${selectedGarment === 'tshirt' ? ' occlusion-active' : ''}`}
+              onClick={toggleTshirt}
+              title={selectedGarment === 'tshirt' ? 'Hide 3D T-Shirt' : 'Show 3D T-Shirt'}
+              style={{ position: 'relative' }}
+            >
+              <span style={{ fontSize: '1.1rem', lineHeight: 1 }}>👕</span>
+              {glbStatus === GLB_STATUS.LOADING && (
+                <span style={{
+                  position: 'absolute', bottom: '-2px', right: '-2px',
+                  width: '10px', height: '10px', borderRadius: '50%',
+                  background: '#FBBF24', border: '2px solid #000',
+                }} />
+              )}
+              {glbStatus === GLB_STATUS.READY && selectedGarment === 'tshirt' && (
+                <span style={{
+                  position: 'absolute', bottom: '-2px', right: '-2px',
+                  width: '10px', height: '10px', borderRadius: '50%',
+                  background: '#10B981', border: '2px solid #000',
+                }} />
+              )}
             </button>
 
             <button
