@@ -1,419 +1,430 @@
-import React, { useRef, useEffect, useState } from 'react';
+import React, { useRef, useEffect, useState, useCallback } from 'react';
 import { useApp } from '../context/AppContext';
 import { CameraManager } from '../modules/CameraManager';
 import { PoseTracker } from '../modules/PoseTracker';
 import { GarmentRenderer } from '../modules/GarmentRenderer';
-import { GarmentSelector } from './GarmentSelector';
-import { OutfitBuilder } from './OutfitBuilder';
-import { SizeConfidence } from './SizeConfidence';
+import { GarmentLibrary } from './GarmentLibrary';
+import { GarmentUploader } from './GarmentUploader';
+import { LayerPanel } from './LayerPanel';
 import {
-  X,
-  Camera,
-  RefreshCw,
-  Layers,
-  Sparkles,
-  ShoppingBag,
-  Share2,
-  Check,
-  Eye,
-  EyeOff
+  X, Camera, RefreshCw, Layers, Eye, EyeOff, Loader, Upload
 } from 'lucide-react';
+
+// ─── Camera states ─────────────────────────────────────────────────────────
+
+const CAM = {
+  IDLE:       'idle',
+  REQUESTING: 'requesting',
+  ACTIVE:     'active',
+  DENIED:     'denied',
+  ERROR:      'error',
+};
+
+const MODEL = {
+  IDLE:    'idle',
+  LOADING: 'loading',
+  READY:   'ready',
+  ERROR:   'error',
+};
+
+// ─── Component ─────────────────────────────────────────────────────────────
 
 export const TryOnCanvas = () => {
   const {
     isTryOnOpen,
     closeTryOn,
     tryOnGarments,
-    selectedSize,
-    setSelectedSize,
     selectedColor,
-    setSelectedColor,
-    addToCart
   } = useApp();
 
-  const videoRef = useRef(null);
+  // DOM refs
+  const videoRef  = useRef(null);
   const canvasRef = useRef(null);
+  const rafRef    = useRef(null);
 
-  const cameraManagerRef = useRef(new CameraManager());
-  const poseTrackerRef = useRef(new PoseTracker());
-  const garmentRendererRef = useRef(new GarmentRenderer());
+  // Module singletons
+  const cameraRef   = useRef(null);
+  const trackerRef  = useRef(null);
+  const rendererRef = useRef(null);
 
-  const [facingMode, setFacingMode] = useState('user');
-  const [isCameraActive, setIsCameraActive] = useState(false);
-  const [isPoseDetected, setIsPoseDetected] = useState(true);
-  const [isSkeletonVisible, setIsSkeletonVisible] = useState(false);
-  const [isOutfitBuilderOpen, setIsOutfitBuilderOpen] = useState(false);
-  const [snapshotUrl, setSnapshotUrl] = useState(null);
-  const [fitPercentage, setFitPercentage] = useState(82);
+  if (!cameraRef.current)   cameraRef.current   = new CameraManager();
+  if (!trackerRef.current)  trackerRef.current   = new PoseTracker();
+  if (!rendererRef.current) rendererRef.current  = new GarmentRenderer();
 
-  const animFrameIdRef = useRef(null);
+  // Camera state
+  const [facingMode,   setFacingMode]   = useState('user');
+  const [camStatus,    setCamStatus]    = useState(CAM.IDLE);
+  const [camError,     setCamError]     = useState('');
 
-  // Initialize camera and pose tracker
-  useEffect(() => {
-    if (!isTryOnOpen) return;
+  // Pose model state
+  const [modelStatus,  setModelStatus]  = useState(MODEL.IDLE);
 
-    let isMounted = true;
+  // UI state
+  const [isPoseDetected,    setIsPoseDetected]    = useState(false);
+  const [isSkeletonVisible, setIsSkeletonVisible] = useState(true);
+  const [isOcclusionOn,     setIsOcclusionOn]     = useState(true);
+  const [isOutlineVisible,  setIsOutlineVisible]  = useState(true);  // tracking outline on by default
+  const [isDebugVisible,    setIsDebugVisible]    = useState(false);
+  const [isLayerPanelOpen,  setIsLayerPanelOpen]  = useState(false);
+  const [isUploaderOpen,    setIsUploaderOpen]    = useState(false);
 
-    const initTracker = async () => {
-      await poseTrackerRef.current.initialize();
-    };
-    initTracker();
+  // Debug metrics (refs to avoid re-renders)
+  const debugRef   = useRef({ fps: 0, confidence: 0, landmarks: 0, trackingState: 'SEARCHING' });
+  const fpsRef     = useRef({ frames: 0, last: performance.now() });
+  const poseDetRef = useRef(false);
+  const [debugSnap, setDebugSnap] = useState({ fps: 0, confidence: 0, landmarks: 0, trackingState: 'SEARCHING' });
 
-    const startWebcam = async () => {
-      if (videoRef.current) {
-        const res = await cameraManagerRef.current.startCamera(videoRef.current, facingMode);
-        if (isMounted) {
-          setIsCameraActive(res.success);
-        }
-      }
-    };
-    startWebcam();
+  // ── Load pose model ────────────────────────────────────────────────────
 
-    return () => {
-      isMounted = false;
-      cameraManagerRef.current.stopCamera();
-      if (animFrameIdRef.current) {
-        cancelAnimationFrame(animFrameIdRef.current);
-      }
-    };
-  }, [isTryOnOpen, facingMode]);
+  const loadModel = useCallback(async () => {
+    if (modelStatus !== MODEL.IDLE) return;
+    setModelStatus(MODEL.LOADING);
+    const ok = await trackerRef.current.initialize();
+    setModelStatus(ok ? MODEL.READY : MODEL.ERROR);
+  }, [modelStatus]);
 
-  // Main 60 FPS Render Loop
-  useEffect(() => {
-    if (!isTryOnOpen) return;
+  // ── Start camera ───────────────────────────────────────────────────────
 
-    const renderFrame = (timestamp) => {
-      const canvas = canvasRef.current;
-      const video = videoRef.current;
+  const startCamera = useCallback(async (mode) => {
+    const m = mode ?? facingMode;
+    setCamStatus(CAM.REQUESTING);
+    setCamError('');
+    trackerRef.current.resetSmoothing();
 
-      if (canvas) {
-        const width = canvas.clientWidth || window.innerWidth;
-        const height = canvas.clientHeight || window.innerHeight;
-
-        if (canvas.width !== width || canvas.height !== height) {
-          canvas.width = width;
-          canvas.height = height;
-        }
-
-        const ctx = canvas.getContext('2d');
-        ctx.clearRect(0, 0, width, height);
-
-        // Detect body pose landmarks
-        const pose = poseTrackerRef.current.detectPose(video, width, height, timestamp);
-
-        if (pose && pose.detected) {
-          setIsPoseDetected(true);
-          // Render dynamic garment overlay layers
-          garmentRendererRef.current.showSkeleton = isSkeletonVisible;
-          garmentRendererRef.current.render(ctx, pose, tryOnGarments, selectedColor);
-
-          // Calculate fit confidence based on shoulder width ratio vs selected size
-          const sizeRatios = { S: 0.9, M: 1.0, L: 1.1, XL: 1.2 };
-          const targetRatio = sizeRatios[selectedSize] || 1.0;
-          const detectedRatio = (pose.shoulderWidth / (width * 0.35)) || 1.0;
-          const delta = Math.abs(detectedRatio - targetRatio);
-          const conf = Math.max(65, Math.min(98, Math.round(92 - delta * 30)));
-          setFitPercentage(conf);
-        } else {
-          setIsPoseDetected(false);
-        }
-      }
-
-      animFrameIdRef.current = requestAnimationFrame(renderFrame);
-    };
-
-    animFrameIdRef.current = requestAnimationFrame(renderFrame);
-
-    return () => {
-      if (animFrameIdRef.current) {
-        cancelAnimationFrame(animFrameIdRef.current);
-      }
-    };
-  }, [isTryOnOpen, tryOnGarments, selectedColor, selectedSize, isSkeletonVisible]);
-
-  const toggleCameraFacing = async () => {
-    const newFacing = facingMode === 'user' ? 'environment' : 'user';
-    setFacingMode(newFacing);
-  };
-
-  const captureSnapshot = () => {
-    const canvas = canvasRef.current;
-    const video = videoRef.current;
-
-    if (!canvas) return;
-
-    // Create temporary snapshot canvas merging camera video + garment overlay
-    const snapCanvas = document.createElement('canvas');
-    snapCanvas.width = canvas.width;
-    snapCanvas.height = canvas.height;
-    const snapCtx = snapCanvas.getContext('2d');
-
-    if (video && video.readyState >= 2) {
-      snapCtx.save();
-      if (facingMode === 'user') {
-        snapCtx.translate(snapCanvas.width, 0);
-        snapCtx.scale(-1, 1);
-      }
-      snapCtx.drawImage(video, 0, 0, snapCanvas.width, snapCanvas.height);
-      snapCtx.restore();
+    const res = await cameraRef.current.startCamera(videoRef.current, m);
+    if (res.success) {
+      setCamStatus(CAM.ACTIVE);
     } else {
-      snapCtx.fillStyle = '#1A1A1A';
-      snapCtx.fillRect(0, 0, snapCanvas.width, snapCanvas.height);
+      const name = res.error?.name ?? '';
+      if (name === 'NotAllowedError' || name === 'PermissionDeniedError') {
+        setCamStatus(CAM.DENIED);
+        setCamError('Camera access was denied. Allow camera in your browser settings and retry.');
+      } else if (name === 'NotFoundError') {
+        setCamStatus(CAM.ERROR);
+        setCamError('No camera found on this device.');
+      } else {
+        setCamStatus(CAM.ERROR);
+        setCamError('Could not start camera: ' + (res.error?.message ?? 'Unknown error'));
+      }
     }
+  }, [facingMode]);
 
-    // Draw canvas garment overlay on top
-    snapCtx.drawImage(canvas, 0, 0);
+  // ── Enable camera handler (button tap) ────────────────────────────────
 
-    // Add VybeFit Watermark
-    snapCtx.fillStyle = '#FF2A5F';
-    snapCtx.font = '800 24px Outfit, sans-serif';
-    snapCtx.fillText('VybeFit Virtual Try-On', 20, snapCanvas.height - 30);
+  const handleEnable = useCallback(() => {
+    loadModel();          // start loading model in parallel
+    startCamera(facingMode);
+  }, [loadModel, startCamera, facingMode]);
 
-    const dataUrl = snapCanvas.toDataURL('image/png');
-    setSnapshotUrl(dataUrl);
-  };
+  // ── Flip camera ────────────────────────────────────────────────────────
+
+  const handleFlip = useCallback(async () => {
+    const next = facingMode === 'user' ? 'environment' : 'user';
+    setFacingMode(next);
+    await startCamera(next);
+  }, [facingMode, startCamera]);
+
+  // ── Cleanup on close ───────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!isTryOnOpen) {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      cameraRef.current.stopCamera();
+      setCamStatus(CAM.IDLE);
+      setIsPoseDetected(false);
+      poseDetRef.current = false;
+    }
+  }, [isTryOnOpen]);
+
+  // ── Render loop ────────────────────────────────────────────────────────
+
+  useEffect(() => {
+    if (!isTryOnOpen || camStatus !== CAM.ACTIVE) return;
+
+    const canvas   = canvasRef.current;
+    const video    = videoRef.current;
+    const tracker  = trackerRef.current;
+    const renderer = rendererRef.current;
+
+    // Configure renderer flags
+    renderer.showSkeleton        = isSkeletonVisible;
+    renderer.showOcclusion       = isOcclusionOn;
+    renderer.showTrackingOutline = isOutlineVisible;
+
+    const loop = (ts) => {
+      if (!canvas) { rafRef.current = requestAnimationFrame(loop); return; }
+
+      // Resize canvas to CSS size
+      const cw = canvas.clientWidth;
+      const ch = canvas.clientHeight;
+      if (canvas.width !== cw || canvas.height !== ch) {
+        canvas.width  = cw;
+        canvas.height = ch;
+      }
+
+      const ctx = canvas.getContext('2d');
+      ctx.clearRect(0, 0, cw, ch);
+
+      // Pose detection
+      const pose = tracker.detectPose(video, cw, ch, ts);
+      const detected = !!(pose?.detected);
+
+      if (detected !== poseDetRef.current) {
+        poseDetRef.current = detected;
+        setIsPoseDetected(detected);
+      }
+
+      // Render
+      if (pose?.detected) {
+        renderer.render(ctx, pose, tryOnGarments, selectedColor, cw, ch);
+      }
+
+      // FPS counter
+      const fps = fpsRef.current;
+      fps.frames++;
+      const now = performance.now();
+      if (now - fps.last >= 600) {
+        const fpsVal = Math.round((fps.frames * 1000) / (now - fps.last));
+        debugRef.current.fps           = fpsVal;
+        debugRef.current.confidence    = Math.round((tracker.lastVisibility ?? 0) * 100);
+        debugRef.current.landmarks     = tracker.lastLandmarkCount ?? 0;
+        debugRef.current.trackingState = tracker.trackingState ?? 'SEARCHING';
+        fps.frames = 0;
+        fps.last = now;
+        if (isDebugVisible) setDebugSnap({ ...debugRef.current });
+      }
+
+      rafRef.current = requestAnimationFrame(loop);
+    };
+
+    rafRef.current = requestAnimationFrame(loop);
+    return () => { if (rafRef.current) cancelAnimationFrame(rafRef.current); };
+  }, [isTryOnOpen, camStatus, tryOnGarments, selectedColor, isSkeletonVisible, isOcclusionOn, isOutlineVisible, isDebugVisible]);
+
+  // Keep debug panel live
+  useEffect(() => {
+    if (isDebugVisible) setDebugSnap({ ...debugRef.current });
+  }, [isDebugVisible]);
 
   if (!isTryOnOpen) return null;
 
+  const isLive = camStatus === CAM.ACTIVE;
+
+  // ── Render ─────────────────────────────────────────────────────────────
+
   return (
     <div className="tryon-overlay-screen">
-      {/* Top Header Bar */}
+
+      {/* ── Header ────────────────────────────────────────────────────── */}
       <div className="tryon-header">
-        <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
-          <div
-            style={{
-              width: '28px',
-              height: '28px',
-              borderRadius: '6px',
-              background: 'var(--accent)',
-              display: 'flex',
-              alignItems: 'center',
-              justifyContent: 'center',
-              fontWeight: 800
-            }}
-          >
-            V
-          </div>
+        <div style={{ display: 'flex', alignItems: 'center', gap: '10px' }}>
+          <div style={{
+            width: '30px', height: '30px', borderRadius: '7px',
+            background: 'var(--accent)', display: 'flex', alignItems: 'center',
+            justifyContent: 'center', fontWeight: 900, fontSize: '0.9rem', color: 'white'
+          }}>V</div>
           <div>
-            <h3 style={{ fontSize: '0.95rem', fontWeight: 800 }}>Live Virtual Try-On</h3>
-            <span style={{ fontSize: '0.7rem', color: '#DDD' }}>
-              {tryOnGarments.length} Layer{tryOnGarments.length > 1 ? 's' : ''} Active
+            <h3 style={{ fontSize: '0.95rem', fontWeight: 800, color: 'white' }}>Virtual Try-On</h3>
+            <span style={{ fontSize: '0.7rem', color: '#AAA' }}>
+              {modelStatus === MODEL.LOADING && '⏳ Loading pose model…'}
+              {modelStatus === MODEL.READY   && `${tryOnGarments.filter(g => g.visible !== false).length} layers active`}
+              {modelStatus === MODEL.ERROR   && '⚠ Pose model unavailable'}
+              {modelStatus === MODEL.IDLE    && 'Powered by MediaPipe'}
             </span>
           </div>
         </div>
 
-        <button className="tryon-close-btn" onClick={closeTryOn}>
-          <X size={20} />
-        </button>
+        <div style={{ display: 'flex', gap: '8px', alignItems: 'center' }}>
+          <button
+            onClick={() => setIsDebugVisible(v => !v)}
+            style={{
+              fontSize: '0.68rem', fontWeight: 700, padding: '4px 9px',
+              borderRadius: '6px', color: 'white', border: '1px solid rgba(255,255,255,0.2)',
+              background: isDebugVisible ? 'rgba(255,42,95,0.3)' : 'rgba(255,255,255,0.1)',
+            }}
+          >DEBUG</button>
+
+          <button className="tryon-close-btn" onClick={closeTryOn}>
+            <X size={20} />
+          </button>
+        </div>
       </div>
 
-      {/* Main Camera & Canvas Viewport */}
+      {/* ── Camera viewport ───────────────────────────────────────────── */}
       <div className="tryon-camera-viewport">
+
+        {/* Video feed */}
         <video
           ref={videoRef}
-          playsInline
-          muted
-          className={`tryon-video ${facingMode}`}
+          playsInline muted autoPlay
+          className={`tryon-video${facingMode !== 'user' ? ' rear' : ''}`}
         />
-
-        {/* Dynamic Pose Canvas Layer */}
         <canvas ref={canvasRef} className="tryon-canvas" />
 
-        {/* Pose Status Badge HUD */}
-        <div className="pose-status-badge">
-          <span className={`status-dot ${isPoseDetected ? 'active' : ''}`} />
-          <span>{isPoseDetected ? 'Body Pose Tracked' : 'Position Yourself in Camera'}</span>
-        </div>
+        {/* Permission gate */}
+        {camStatus === CAM.IDLE && (
+          <div className="tryon-permission-gate">
+            <div className="permission-icon">
+              <Camera size={48} color="white" />
+            </div>
+            <h2 className="permission-title">Enable Camera</h2>
+            <p className="permission-subtitle">
+              Allow camera access to virtually try on garments in real time
+              using AI-powered pose tracking.
+            </p>
+            <button className="permission-btn" onClick={handleEnable}>
+              <Camera size={18} />
+              Enable Camera
+            </button>
+          </div>
+        )}
 
-        {/* Bounding Guide Box */}
-        <div className={`pose-alignment-guide ${isPoseDetected ? 'detected' : ''}`}>
-          <div className="head-target" />
-        </div>
+        {/* Requesting */}
+        {camStatus === CAM.REQUESTING && (
+          <div className="tryon-permission-gate">
+            <Loader size={42} color="white" className="spin-icon" />
+            <p className="permission-subtitle" style={{ marginTop: '16px' }}>
+              Requesting camera…
+            </p>
+          </div>
+        )}
 
-        {/* Floating Side Action Controls */}
-        <div className="tryon-floating-controls">
-          <button
-            className="control-circle-btn"
-            onClick={toggleCameraFacing}
-            title="Flip Camera"
-          >
-            <RefreshCw size={20} />
-          </button>
-
-          <button
-            className="control-circle-btn"
-            onClick={() => setIsSkeletonVisible(!isSkeletonVisible)}
-            title="Toggle Skeleton HUD"
-          >
-            {isSkeletonVisible ? <EyeOff size={20} color="var(--accent)" /> : <Eye size={20} />}
-          </button>
-
-          <button
-            className="control-circle-btn"
-            onClick={() => setIsOutfitBuilderOpen(true)}
-            title="Manage Outfit Layers"
-            style={{ position: 'relative' }}
-          >
-            <Layers size={20} />
-            {tryOnGarments.length > 0 && (
-              <span
-                style={{
-                  position: 'absolute',
-                  top: '-2px',
-                  right: '-2px',
-                  background: 'var(--accent)',
-                  width: '18px',
-                  height: '18px',
-                  borderRadius: '50%',
-                  fontSize: '0.75rem',
-                  fontWeight: 800,
-                  display: 'flex',
-                  alignItems: 'center',
-                  justifyContent: 'center'
-                }}
-              >
-                {tryOnGarments.length}
-              </span>
+        {/* Error / Denied */}
+        {(camStatus === CAM.DENIED || camStatus === CAM.ERROR) && (
+          <div className="tryon-permission-gate">
+            <div className="permission-icon" style={{ background: 'rgba(239,68,68,0.2)', borderColor: 'rgba(239,68,68,0.4)' }}>
+              <Camera size={48} color="#FCA5A5" />
+            </div>
+            <h2 className="permission-title" style={{ color: '#FCA5A5' }}>Camera Unavailable</h2>
+            <p className="permission-subtitle">{camError}</p>
+            {camStatus === CAM.ERROR && (
+              <button className="permission-btn" onClick={() => startCamera(facingMode)}>
+                Try Again
+              </button>
             )}
-          </button>
-        </div>
+          </div>
+        )}
 
-        {/* Center Shutter Snapshot Button */}
-        <div className="tryon-shutter-container">
-          <button
-            className="shutter-btn"
-            onClick={captureSnapshot}
-            title="Take Photo"
-          >
-            <div className="shutter-inner" />
-          </button>
-        </div>
+        {/* Model loading pill */}
+        {isLive && modelStatus === MODEL.LOADING && (
+          <div className="model-loading-pill">
+            <Loader size={13} className="spin-icon" />
+            Loading pose model…
+          </div>
+        )}
+
+        {/* Pose status badge */}
+        {isLive && (
+          <div className="pose-status-badge">
+            <span className={`status-dot ${isPoseDetected ? 'active' : ''}`} />
+            <span>{isPoseDetected ? 'Body Tracked' : 'Step into frame'}</span>
+          </div>
+        )}
+
+        {/* Body alignment silhouette guide */}
+        {isLive && !isPoseDetected && (
+          <div className="body-guide">
+            <svg viewBox="0 0 100 200" fill="none" xmlns="http://www.w3.org/2000/svg">
+              <ellipse cx="50" cy="18" rx="14" ry="17" stroke="rgba(255,255,255,0.3)" strokeWidth="2.5" strokeDasharray="5 4" />
+              <path d="M25 45 L20 120 L38 120 L50 80 L62 120 L80 120 L75 45 C70 35 30 35 25 45Z"
+                stroke="rgba(255,255,255,0.28)" strokeWidth="2.5" strokeDasharray="5 4" fill="none" />
+              <path d="M25 50 L8 95 M75 50 L92 95"
+                stroke="rgba(255,255,255,0.28)" strokeWidth="2.5" strokeDasharray="5 4" />
+            </svg>
+          </div>
+        )}
+
+        {/* Debug HUD */}
+        {isDebugVisible && isLive && (
+          <div className="debug-hud">
+            <div className="debug-hud-title">⬡ VybeFit Debug</div>
+            <div>FPS: <b>{debugSnap.fps}</b></div>
+            <div>Conf: <b>{debugSnap.confidence}%</b></div>
+            <div>Landmarks: <b>{debugSnap.landmarks}</b></div>
+            <div>Model: <b style={{ color: modelStatus === MODEL.READY ? '#A3E635' : '#FBBF24' }}>{modelStatus}</b></div>
+            <div>State: <b style={{ color: debugSnap.trackingState === 'TRACKING' ? '#A3E635' : debugSnap.trackingState === 'TEMPORARILY_LOST' ? '#FBBF24' : '#F87171' }}>{debugSnap.trackingState ?? 'SEARCHING'}</b></div>
+            <div>Layers: <b>{tryOnGarments.length}</b></div>
+            <div>Occlusion: <b style={{ color: isOcclusionOn ? '#A3E635' : '#F87171' }}>{isOcclusionOn ? 'ON' : 'OFF'}</b></div>
+          </div>
+        )}
+
+        {/* Floating side controls */}
+        {isLive && (
+          <div className="tryon-floating-controls">
+            <button className="control-circle-btn" onClick={handleFlip} title="Flip Camera">
+              <RefreshCw size={20} />
+            </button>
+
+            <button
+              className="control-circle-btn"
+              onClick={() => setIsSkeletonVisible(v => !v)}
+              title="Toggle Skeleton"
+            >
+              {isSkeletonVisible
+                ? <Eye size={20} color="var(--accent)" />
+                : <Eye size={20} />
+              }
+            </button>
+
+            <button
+              className={`control-circle-btn${isOcclusionOn ? ' occlusion-active' : ''}`}
+              onClick={() => setIsOcclusionOn(v => !v)}
+              title="Toggle Arm Occlusion"
+            >
+              <span style={{ fontSize: '1.1rem', lineHeight: 1 }}>💪</span>
+            </button>
+
+            <button
+              className={`control-circle-btn${isOutlineVisible ? ' occlusion-active' : ''}`}
+              onClick={() => setIsOutlineVisible(v => !v)}
+              title="Toggle Tracking Outline"
+              style={{ fontSize: '1.1rem' }}
+            >
+              <span style={{ fontSize: '1.1rem', lineHeight: 1 }}>🎯</span>
+            </button>
+
+            <button
+              className="control-circle-btn"
+              onClick={() => setIsLayerPanelOpen(true)}
+              title="Layer Manager"
+              style={{ position: 'relative' }}
+            >
+              <Layers size={20} />
+              {tryOnGarments.length > 0 && (
+                <span className="layer-badge">{tryOnGarments.length}</span>
+              )}
+            </button>
+
+            <button
+              className="control-circle-btn"
+              onClick={() => setIsUploaderOpen(true)}
+              title="Upload Garment"
+            >
+              <Upload size={20} />
+            </button>
+          </div>
+        )}
+
       </div>
 
-      {/* Bottom Sheet Control Drawer */}
-      <div className="tryon-bottom-sheet">
-        <div className="sheet-handle" />
-
-        {/* Size Confidence Gauge */}
-        <SizeConfidence size={selectedSize} fitPercentage={fitPercentage} />
-
-        {/* Size & Color Swatches inside Try-On view */}
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-          {/* Sizes */}
-          <div style={{ display: 'flex', gap: '6px' }}>
-            {['S', 'M', 'L', 'XL'].map(sz => (
-              <button
-                key={sz}
-                onClick={() => setSelectedSize(sz)}
-                style={{
-                  width: '34px',
-                  height: '34px',
-                  borderRadius: '8px',
-                  border: '1px solid rgba(255,255,255,0.2)',
-                  background: selectedSize === sz ? 'var(--accent)' : 'rgba(255,255,255,0.1)',
-                  color: 'white',
-                  fontWeight: 700,
-                  fontSize: '0.8rem'
-                }}
-              >
-                {sz}
-              </button>
-            ))}
-          </div>
-
-          {/* Quick Add Outfit to Bag */}
-          <button
-            onClick={() => {
-              tryOnGarments.forEach(g => addToCart(g));
-              closeTryOn();
-            }}
-            style={{
-              background: 'var(--accent)',
-              color: 'white',
-              fontWeight: 800,
-              fontSize: '0.85rem',
-              padding: '10px 18px',
-              borderRadius: 'var(--radius-full)',
-              display: 'flex',
-              alignItems: 'center',
-              gap: '6px',
-              boxShadow: '0 4px 14px rgba(255,42,95,0.4)'
-            }}
-          >
-            <ShoppingBag size={16} />
-            <span>Add Bag (${tryOnGarments.reduce((s, g) => s + g.price, 0)})</span>
-          </button>
-        </div>
-
-        {/* Garment Selector Carousel */}
-        <GarmentSelector />
-      </div>
-
-      {/* Outfit Builder Drawer */}
-      <OutfitBuilder
-        isOpen={isOutfitBuilderOpen}
-        onClose={() => setIsOutfitBuilderOpen(false)}
-      />
-
-      {/* Snapshot Preview Modal */}
-      {snapshotUrl && (
-        <div className="drawer-backdrop" style={{ zIndex: 1500 }}>
-          <div
-            className="drawer-content"
-            style={{
-              maxWidth: '420px',
-              margin: 'auto',
-              height: 'auto',
-              borderRadius: 'var(--radius-lg)',
-              background: '#1A1A1A',
-              color: 'white'
-            }}
-          >
-            <div className="drawer-header" style={{ borderColor: 'rgba(255,255,255,0.1)' }}>
-              <h3 style={{ fontSize: '1.1rem', fontWeight: 800, color: 'white' }}>
-                Your Virtual Try-On Photo 📸
-              </h3>
-              <button className="tryon-close-btn" onClick={() => setSnapshotUrl(null)}>
-                <X size={18} />
-              </button>
-            </div>
-            <div className="drawer-body" style={{ textAlign: 'center' }}>
-              <img
-                src={snapshotUrl}
-                alt="Try-On Snapshot"
-                style={{ width: '100%', borderRadius: 'var(--radius-md)', border: '1px solid rgba(255,255,255,0.2)' }}
-              />
-              <p style={{ fontSize: '0.8rem', color: '#AAA', marginTop: '8px' }}>
-                Fit looks great on you!
-              </p>
-            </div>
-            <div className="drawer-footer" style={{ background: '#121212', borderColor: 'rgba(255,255,255,0.1)', display: 'flex', gap: '10px' }}>
-              <button
-                className="btn-secondary"
-                style={{ background: 'rgba(255,255,255,0.1)', color: 'white', borderColor: 'transparent' }}
-                onClick={() => {
-                  const a = document.createElement('a');
-                  a.href = snapshotUrl;
-                  a.download = 'vybefit-tryon.png';
-                  a.click();
-                }}
-              >
-                Save Image
-              </button>
-              <button
-                className="btn-accent"
-                onClick={() => {
-                  tryOnGarments.forEach(g => addToCart(g));
-                  setSnapshotUrl(null);
-                  closeTryOn();
-                }}
-              >
-                Add Outfit to Bag
-              </button>
-            </div>
-          </div>
+      {/* ── Bottom sheet — garment library ────────────────────────────── */}
+      {isLive && (
+        <div className="tryon-bottom-sheet">
+          <div className="sheet-handle" />
+          <GarmentLibrary onUploadClick={() => setIsUploaderOpen(true)} />
         </div>
       )}
+
+      {/* ── Drawers ────────────────────────────────────────────────────── */}
+      <LayerPanel
+        isOpen={isLayerPanelOpen}
+        onClose={() => setIsLayerPanelOpen(false)}
+      />
+
+      <GarmentUploader
+        isOpen={isUploaderOpen}
+        onClose={() => setIsUploaderOpen(false)}
+      />
     </div>
   );
 };

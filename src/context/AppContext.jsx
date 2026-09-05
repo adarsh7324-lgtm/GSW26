@@ -7,7 +7,7 @@ export const AppProvider = ({ children }) => {
   const [activePage, setActivePage] = useState('home');
   const [selectedProduct, setSelectedProduct] = useState(PRODUCTS[0]);
   const [isTryOnOpen, setIsTryOnOpen] = useState(false);
-  const [tryOnGarments, setTryOnGarments] = useState([PRODUCTS[0]]);
+  const [tryOnGarments, setTryOnGarments] = useState([]);
   const [selectedSize, setSelectedSize] = useState('M');
   const [selectedColor, setSelectedColor] = useState(null);
   const [cart, setCart] = useState([
@@ -51,16 +51,65 @@ export const AppProvider = ({ children }) => {
     setIsTryOnOpen(false);
   };
 
-  const addToTryOnOutfit = (product) => {
+  /**
+   * Add a garment to the active try-on outfit.
+   * Multiple garments of the SAME templateId can now coexist (layering).
+   * A garment with the same `id` replaces the existing one.
+   */
+  const addToTryOnOutfit = (garment) => {
     setTryOnGarments(prev => {
-      // Filter out existing item of same layer type or duplicate ID
-      const filtered = prev.filter(g => g.overlayType !== product.overlayType && g.id !== product.id);
-      return [...filtered, product];
+      // Replace exact same id (re-selection = no duplicate)
+      const filtered = prev.filter(g => g.id !== garment.id);
+      // Ensure defaults
+      const normalized = {
+        visible: true,
+        opacity: 1,
+        ...garment,
+      };
+      return [...filtered, normalized];
     });
   };
 
-  const removeFromTryOnOutfit = (productId) => {
-    setTryOnGarments(prev => prev.filter(g => g.id !== productId));
+  const removeFromTryOnOutfit = (garmentId) => {
+    setTryOnGarments(prev => prev.filter(g => g.id !== garmentId));
+  };
+
+  /**
+   * Add an uploaded garment (with a processed garmentCanvas) to the outfit.
+   * Exposed separately so GarmentUploader can call it.
+   */
+  const addUploadedGarment = async (garment) => {
+    addToTryOnOutfit(garment);
+  };
+
+  /**
+   * Toggle a garment layer's visibility (hide/show without removing it).
+   */
+  const toggleGarmentVisibility = (garmentId) => {
+    setTryOnGarments(prev =>
+      prev.map(g =>
+        g.id === garmentId ? { ...g, visible: !(g.visible !== false) } : g
+      )
+    );
+  };
+
+  /**
+   * Move a garment up or down in the render stack.
+   * 'up' means higher z-order (rendered later = visually on top).
+   */
+  const moveGarmentLayer = (garmentId, direction) => {
+    setTryOnGarments(prev => {
+      const idx = prev.findIndex(g => g.id === garmentId);
+      if (idx === -1) return prev;
+
+      const next = [...prev];
+      const targetIdx = direction === 'up' ? idx + 1 : idx - 1;
+      if (targetIdx < 0 || targetIdx >= next.length) return prev;
+
+      // Swap
+      [next[idx], next[targetIdx]] = [next[targetIdx], next[idx]];
+      return next;
+    });
   };
 
   const addToHistory = (product) => {
@@ -71,7 +120,7 @@ export const AppProvider = ({ children }) => {
   };
 
   const addToCart = (product = selectedProduct, size = selectedSize, color = selectedColor) => {
-    const itemColor = color || product.colors[0];
+    const itemColor = color || (product.colors && product.colors[0]) || '#000';
     setCart(prev => {
       const existingIdx = prev.findIndex(
         item => item.product.id === product.id && item.size === size && item.color === itemColor
@@ -90,9 +139,7 @@ export const AppProvider = ({ children }) => {
     setCart(prev => {
       const updated = [...prev];
       const newQty = updated[index].quantity + delta;
-      if (newQty <= 0) {
-        return updated.filter((_, i) => i !== index);
-      }
+      if (newQty <= 0) return updated.filter((_, i) => i !== index);
       updated[index].quantity = newQty;
       return updated;
     });
@@ -102,15 +149,16 @@ export const AppProvider = ({ children }) => {
     setCart(prev => prev.filter((_, i) => i !== index));
   };
 
-  const getCartTotal = () => {
-    return cart.reduce((total, item) => total + item.product.price * item.quantity, 0);
-  };
+  const getCartTotal = () =>
+    cart.reduce((total, item) => total + item.product.price * item.quantity, 0);
 
   const placeOrder = (orderDetails) => {
     const newOrder = {
       orderId: 'VYBE-' + Math.floor(100000 + Math.random() * 900000),
       date: new Date().toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-      estimatedDelivery: new Date(Date.now() + 3 * 86400000).toLocaleDateString('en-US', { weekday: 'short', month: 'short', day: 'numeric' }),
+      estimatedDelivery: new Date(Date.now() + 3 * 86400000).toLocaleDateString('en-US', {
+        weekday: 'short', month: 'short', day: 'numeric'
+      }),
       items: [...cart],
       total: getCartTotal(),
       shippingAddress: orderDetails.address || '123 Fashion Ave, NY'
@@ -122,44 +170,40 @@ export const AppProvider = ({ children }) => {
   return (
     <AppContext.Provider
       value={{
-        activePage,
-        setActivePage,
-        selectedProduct,
-        setSelectedProduct,
+        // Navigation
+        activePage, setActivePage,
+        selectedProduct, setSelectedProduct,
         openProductDetail,
-        isTryOnOpen,
-        openTryOn,
-        closeTryOn,
+
+        // Try-On
+        isTryOnOpen, openTryOn, closeTryOn,
         tryOnGarments,
         addToTryOnOutfit,
         removeFromTryOnOutfit,
-        selectedSize,
-        setSelectedSize,
-        selectedColor,
-        setSelectedColor,
-        cart,
-        addToCart,
-        updateCartQuantity,
-        removeFromCart,
-        getCartTotal,
-        isCartOpen,
-        setIsCartOpen,
-        tryOnHistory,
-        isHistoryOpen,
-        setIsHistoryOpen,
-        searchQuery,
-        setSearchQuery,
-        selectedGender,
-        setSelectedGender,
-        selectedCategory,
-        setSelectedCategory,
-        priceRange,
-        setPriceRange,
-        sortBy,
-        setSortBy,
-        orderConfirmed,
-        setOrderConfirmed,
-        placeOrder
+        addUploadedGarment,
+        toggleGarmentVisibility,
+        moveGarmentLayer,
+
+        // Size & Color
+        selectedSize, setSelectedSize,
+        selectedColor, setSelectedColor,
+
+        // Cart
+        cart, addToCart, updateCartQuantity, removeFromCart, getCartTotal,
+        isCartOpen, setIsCartOpen,
+
+        // History
+        tryOnHistory, isHistoryOpen, setIsHistoryOpen,
+
+        // Catalog filters
+        searchQuery, setSearchQuery,
+        selectedGender, setSelectedGender,
+        selectedCategory, setSelectedCategory,
+        priceRange, setPriceRange,
+        sortBy, setSortBy,
+
+        // Orders
+        orderConfirmed, setOrderConfirmed, placeOrder,
       }}
     >
       {children}

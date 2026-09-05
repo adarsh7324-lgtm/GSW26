@@ -590,6 +590,80 @@ a {
   overflow: hidden;
 }
 
+/* Camera Permission Gate */
+.tryon-permission-gate {
+  position: absolute;
+  inset: 0;
+  z-index: 50;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  background: radial-gradient(ellipse at center, #1A1A1A 0%, #000 100%);
+  color: white;
+  padding: 2rem;
+  text-align: center;
+}
+
+.permission-icon {
+  width: 96px;
+  height: 96px;
+  border-radius: 50%;
+  background: rgba(255, 42, 95, 0.15);
+  border: 2px solid rgba(255, 42, 95, 0.35);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 1.5rem;
+  animation: pulseGlow 2.5s infinite;
+}
+
+.permission-title {
+  font-size: 1.6rem;
+  font-weight: 800;
+  margin-bottom: 0.6rem;
+  color: white;
+}
+
+.permission-subtitle {
+  font-size: 0.92rem;
+  color: #A0A0A0;
+  max-width: 300px;
+  line-height: 1.5;
+  margin-bottom: 1.75rem;
+}
+
+.permission-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  background: var(--accent);
+  color: white;
+  font-weight: 700;
+  font-size: 1rem;
+  padding: 14px 28px;
+  border-radius: var(--radius-full);
+  box-shadow: 0 8px 24px rgba(255, 42, 95, 0.4);
+  transition: all 0.2s ease;
+}
+
+.permission-btn:hover {
+  background: var(--accent-hover);
+  transform: translateY(-2px);
+  box-shadow: 0 12px 30px rgba(255, 42, 95, 0.5);
+}
+
+/* Spinner */
+@keyframes spin {
+  from { transform: rotate(0deg); }
+  to { transform: rotate(360deg); }
+}
+
+.spin-icon {
+  animation: spin 1s linear infinite;
+}
+
+
 .tryon-header {
   position: absolute;
   top: 0;
@@ -743,7 +817,7 @@ a {
 /* Shutter Capture Button */
 .tryon-shutter-container {
   position: absolute;
-  bottom: 220px;
+  bottom: 210px;
   left: 50%;
   transform: translateX(-50%);
   z-index: 25;
@@ -781,17 +855,19 @@ a {
   left: 0;
   right: 0;
   z-index: 30;
+  max-height: 200px;
+  overflow: hidden;
   background: rgba(18, 18, 18, 0.92);
   backdrop-filter: blur(20px);
   -webkit-backdrop-filter: blur(20px);
   border-top-left-radius: var(--radius-lg);
   border-top-right-radius: var(--radius-lg);
   border-top: 1px solid rgba(255, 255, 255, 0.12);
-  padding: 16px;
+  padding: 10px 16px 16px;
   color: white;
   display: flex;
   flex-direction: column;
-  gap: 12px;
+  gap: 8px;
 }
 
 .sheet-handle {
@@ -842,8 +918,8 @@ a {
 }
 
 .garment-thumb-card {
-  flex: 0 0 80px;
-  height: 100px;
+  flex: 0 0 66px;
+  height: 80px;
   background: rgba(255,255,255,0.06);
   border-radius: var(--radius-md);
   border: 2px solid transparent;
@@ -863,7 +939,7 @@ a {
 
 .garment-thumb-img {
   width: 100%;
-  height: 70px;
+  height: 52px;
   object-fit: cover;
 }
 
@@ -884,11 +960,10 @@ a {
   background: rgba(255, 255, 255, 0.08);
   border: 1px solid rgba(255, 255, 255, 0.15);
   border-radius: var(--radius-md);
-  padding: 12px 16px;
+  padding: 8px 12px;
   display: flex;
   align-items: center;
   justify-content: space-between;
-  margin-top: 4px;
 }
 
 .confidence-bar-bg {
@@ -1023,4 +1098,338 @@ a {
 
 .form-input:focus {
   border-color: var(--text-main);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   GARMENT LIBRARY
+═══════════════════════════════════════════════════════════════════════════ */
+
+.garment-library {
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+}
+
+.library-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 0 0 10px;
+  overflow-x: auto;
+  scrollbar-width: none;
+}
+.library-tabs::-webkit-scrollbar { display: none; }
+
+.library-tab {
+  flex-shrink: 0;
+  padding: 5px 14px;
+  border-radius: 999px;
+  font-size: 0.75rem;
+  font-weight: 700;
+  border: 1px solid rgba(255,255,255,0.18);
+  background: transparent;
+  color: rgba(255,255,255,0.6);
+  transition: all 0.15s;
+}
+.library-tab.active,
+.library-tab:hover {
+  background: rgba(255,255,255,0.12);
+  color: white;
+  border-color: rgba(255,255,255,0.35);
+}
+.library-tab.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: white;
+}
+
+.library-scroll {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: none;
+}
+.library-scroll::-webkit-scrollbar { display: none; }
+
+.library-card {
+  flex-shrink: 0;
+  width: 82px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: none;
+  color: white;
+  cursor: pointer;
+  padding: 0;
+  transition: transform 0.15s;
+}
+.library-card:hover { transform: translateY(-2px); }
+.library-card.active .library-thumb-wrap {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 2px var(--accent);
+}
+
+.library-thumb-wrap {
+  width: 80px;
+  height: 96px;
+  border-radius: 10px;
+  overflow: hidden;
+  border: 2px solid rgba(255,255,255,0.15);
+  background: rgba(255,255,255,0.06);
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: border-color 0.15s;
+}
+
+.library-thumb-img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+
+.library-color-dot {
+  position: absolute;
+  bottom: 5px;
+  right: 5px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  border: 1.5px solid rgba(255,255,255,0.6);
+}
+
+.library-active-badge {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: var(--accent);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+}
+
+.library-card-name {
+  font-size: 0.68rem;
+  font-weight: 700;
+  text-align: center;
+  line-height: 1.2;
+  max-width: 80px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: rgba(255,255,255,0.85);
+}
+
+.library-card-price {
+  font-size: 0.65rem;
+  font-weight: 600;
+  color: rgba(255,255,255,0.5);
+}
+
+/* Upload card */
+.library-upload-card .library-thumb-wrap {
+  border-style: dashed;
+  border-color: rgba(255,42,95,0.45);
+}
+.library-upload-thumb {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   GARMENT UPLOADER
+═══════════════════════════════════════════════════════════════════════════ */
+
+.upload-drop-zone {
+  border: 2px dashed rgba(255,255,255,0.2);
+  border-radius: var(--radius-md);
+  padding: 2rem 1.5rem;
+  text-align: center;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+}
+.upload-drop-zone:hover {
+  border-color: var(--accent);
+  background: rgba(255,42,95,0.05);
+}
+
+.upload-drop-icon {
+  width: 72px;
+  height: 72px;
+  border-radius: 50%;
+  background: rgba(255,42,95,0.12);
+  border: 1.5px solid rgba(255,42,95,0.3);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 4px;
+}
+
+.upload-drop-title {
+  font-size: 1rem;
+  font-weight: 800;
+  color: white;
+}
+
+.upload-drop-sub {
+  font-size: 0.82rem;
+  color: #888;
+}
+
+.upload-drop-tip {
+  font-size: 0.76rem;
+  color: rgba(255,255,255,0.4);
+  margin-top: 4px;
+  padding: 6px 12px;
+  background: rgba(255,255,255,0.05);
+  border-radius: 8px;
+  line-height: 1.5;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   DEBUG HUD
+═══════════════════════════════════════════════════════════════════════════ */
+
+.debug-hud {
+  position: absolute;
+  top: 110px;
+  left: 12px;
+  z-index: 40;
+  background: rgba(0,0,0,0.80);
+  backdrop-filter: blur(8px);
+  color: #A3E635;
+  font-family: monospace;
+  font-size: 0.75rem;
+  padding: 10px 14px;
+  border-radius: 10px;
+  border: 1px solid rgba(163,230,53,0.25);
+  line-height: 1.75;
+  min-width: 170px;
+  pointer-events: none;
+}
+
+.debug-hud-title {
+  color: #FF2A5F;
+  font-weight: 800;
+  margin-bottom: 4px;
+  font-size: 0.78rem;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   MODEL LOADING PILL
+═══════════════════════════════════════════════════════════════════════════ */
+
+.model-loading-pill {
+  position: absolute;
+  top: 68px;
+  left: 50%;
+  transform: translateX(-50%);
+  z-index: 20;
+  background: rgba(0,0,0,0.7);
+  backdrop-filter: blur(10px);
+  color: white;
+  padding: 7px 16px;
+  border-radius: 999px;
+  font-size: 0.78rem;
+  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  border: 1px solid rgba(255,255,255,0.15);
+  white-space: nowrap;
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BODY ALIGNMENT GUIDE
+═══════════════════════════════════════════════════════════════════════════ */
+
+.body-guide {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  pointer-events: none;
+  z-index: 5;
+}
+
+.body-guide svg {
+  height: 55%;
+  width: auto;
+  opacity: 0.6;
+  animation: pulse-guide 2.5s ease-in-out infinite;
+}
+
+@keyframes pulse-guide {
+  0%, 100% { opacity: 0.4; }
+  50%       { opacity: 0.75; }
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   LAYER BADGE & OCCLUSION BUTTON
+═══════════════════════════════════════════════════════════════════════════ */
+
+.layer-badge {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  background: var(--accent);
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  font-size: 0.68rem;
+  font-weight: 800;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  color: white;
+}
+
+.control-circle-btn.occlusion-active {
+  background: rgba(255,42,95,0.25);
+  border: 1px solid rgba(255,42,95,0.5);
+}
+
+/* ═══════════════════════════════════════════════════════════════════════════
+   BOTTOM SHEET — updated for library
+═══════════════════════════════════════════════════════════════════════════ */
+
+.tryon-bottom-sheet {
+  position: relative;
+  background: rgba(10,10,10,0.92);
+  backdrop-filter: blur(20px);
+  border-top: 1px solid rgba(255,255,255,0.10);
+  padding: 10px 16px 16px;
+  z-index: 10;
+  max-height: 220px;
+  overflow: hidden;
+  color: white;
+  flex-shrink: 0;
+}
+
+.sheet-handle {
+  width: 36px;
+  height: 4px;
+  border-radius: 2px;
+  background: rgba(255,255,255,0.2);
+  margin: 0 auto 10px;
+}
+
+/* Pulse animation for permission gate icon */
+@keyframes pulseGlow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255,42,95,0.35); }
+  50%       { box-shadow: 0 0 0 12px rgba(255,42,95,0); }
 }

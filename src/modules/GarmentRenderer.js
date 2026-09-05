@@ -1,295 +1,418 @@
+import { getTemplate, overlayTypeToTemplateId } from '../lib/garmentTemplates.js';
+import { MeshDeformer } from './MeshDeformer.js';
+
+/**
+ * GarmentRenderer
+ *
+ * Responsibilities:
+ *  1. Render uploaded garment images using MeshDeformer (bilinear triangle mesh)
+ *  2. Apply arm occlusion — arms appear IN FRONT of garments
+ *  3. Render debug skeleton HUD
+ *
+ * IMPORTANT: If no garment image is available, NOTHING is drawn.
+ * There is NO default/fallback vector shirt rendered. The camera feed shows
+ * through unaltered until the user selects a real garment.
+ *
+ * ARM OCCLUSION TECHNIQUE:
+ *  - Garments are drawn on an internal off-screen canvas
+ *  - Arm regions are erased from the off-screen canvas (destination-out composite)
+ *  - Result is composited onto the main canvas
+ *  - Erased regions reveal the underlying video element, so arms appear
+ *    in front of the garment without needing a separate segmentation model.
+ */
 export class GarmentRenderer {
   constructor() {
-    this.showSkeleton = false;
+    this.showSkeleton        = true;   // On by default so tracking is always visible
+    this.showOcclusion       = true;
+    this.showTrackingOutline = true;   // Glowing bounding box to assess fit quality
+
+    // Off-screen canvas reused across frames for garment compositing
+    this._offscreen = null;
+    this._offCtx    = null;
+
+    // Mesh deformer singleton
+    this._deformer = new MeshDeformer(6, 9);
+
+    // Image cache: garmentId → HTMLCanvasElement (bg-removed, alpha-cropped)
+    this._imageCache = new Map();
   }
 
-  render(ctx, pose, activeGarments = [], selectedColor = null) {
+  // ─── Public API ───────────────────────────────────────────────────────────
+
+  /**
+   * Main render call — invoke once per animation frame.
+   *
+   * @param {CanvasRenderingContext2D} ctx         Main canvas context
+   * @param {Object}                  pose         Output of PoseTracker._computeMetrics()
+   * @param {Array}                   activeGarments
+   * @param {string|null}             selectedColor  Hex color override (unused for image garments)
+   * @param {number}                  canvasW
+   * @param {number}                  canvasH
+   */
+  render(ctx, pose, activeGarments = [], selectedColor = null, canvasW = 0, canvasH = 0) {
     if (!ctx || !pose || !pose.detected) return;
 
-    const { chestCenter, hipCenter, shoulderWidth, hipWidth, torsoHeight, torsoAngle } = pose;
+    const w = canvasW || ctx.canvas.width;
+    const h = canvasH || ctx.canvas.height;
 
-    // Draw active garment layers ordered from base to outerwear
-    const layers = this.sortLayers(activeGarments);
+    this._ensureOffscreen(w, h);
+    const oCtx = this._offCtx;
+    oCtx.clearRect(0, 0, w, h);
 
-    layers.forEach(item => {
-      ctx.save();
-      const color = selectedColor || item.overlayColor || '#1A1A1A';
+    let garmentDrawn = false;
 
-      if (item.overlayType === 'top' || item.overlayType === 'hoodie') {
-        this.renderTop(ctx, chestCenter, shoulderWidth, torsoHeight, torsoAngle, color, item);
-      } else if (item.overlayType === 'outerwear') {
-        this.renderOuterwear(ctx, chestCenter, shoulderWidth, torsoHeight, torsoAngle, color, item);
-      } else if (item.overlayType === 'dress') {
-        this.renderDress(ctx, chestCenter, shoulderWidth, torsoHeight, torsoAngle, color, item);
-      } else if (item.overlayType === 'bottom') {
-        this.renderBottom(ctx, hipCenter, hipWidth || shoulderWidth * 0.85, torsoHeight, torsoAngle, color, item);
-      }
-      ctx.restore();
-    });
+    // ── Render garment layers (in array order — respects LayerPanel ordering) ─
+    for (const garment of activeGarments) {
+      if (garment.visible === false) continue;
 
-    // Optionally render tracking landmarks HUD overlay
+      const processedCanvas = garment.garmentCanvas || this._imageCache.get(garment.id);
+      if (!processedCanvas) continue;  // No image → draw NOTHING (P0: no black base tee)
+
+      const templateId = garment.templateId || overlayTypeToTemplateId(garment.overlayType);
+      const template   = getTemplate(templateId);
+
+      oCtx.save();
+      oCtx.globalAlpha = garment.opacity ?? 1;
+      this._deformer.draw(oCtx, processedCanvas, pose, template);
+      oCtx.restore();
+
+      garmentDrawn = true;
+    }
+
+    // ── Arm occlusion (only if a garment was actually drawn) ─────────────────
+    if (garmentDrawn && this.showOcclusion && pose.leftShoulder && pose.rightShoulder) {
+      oCtx.save();
+      oCtx.globalCompositeOperation = 'destination-out';
+      this._drawArmMask(oCtx, pose);
+      oCtx.restore();
+    }
+
+    // ── Composite garment layer onto main canvas ──────────────────────────────
+    ctx.drawImage(this._offscreen, 0, 0);
+
+    // ── Tracking outline (drawn above garments, below skeleton) ───────────────
+    if (this.showTrackingOutline && activeGarments.some(g => g.visible !== false)) {
+      this._renderTrackingOutline(ctx, pose);
+    }
+
+    // ── Debug skeleton (drawn directly on main canvas, always on top) ─────────
     if (this.showSkeleton) {
-      this.renderSkeleton(ctx, pose);
+      this._renderDebugSkeleton(ctx, pose);
     }
   }
 
-  sortLayers(garments) {
-    const order = { bottom: 1, top: 2, dress: 2, outerwear: 3 };
-    return [...garments].sort((a, b) => (order[a.overlayType] || 2) - (order[b.overlayType] || 2));
+  /**
+   * Cache a processed (bg-removed, alpha-cropped) canvas for a garment id.
+   */
+  cacheGarmentImage(garmentId, canvas) {
+    this._imageCache.set(garmentId, canvas);
   }
 
-  renderTop(ctx, center, shoulderW, torsoH, angle, color, item) {
-    ctx.translate(center.x, center.y);
-    ctx.rotate(angle);
+  getCachedImage(garmentId) {
+    return this._imageCache.get(garmentId) ?? null;
+  }
 
-    const asset = item.garmentAsset || {};
-    const w = shoulderWidthMultiplier(shoulderW, asset.shoulderWidth || 1.15);
-    const h = torsoH * (asset.length || 1.15);
-    const neckW = w * (asset.neckWidth || 0.35);
+  // ─── Arm Occlusion ────────────────────────────────────────────────────────
 
-    // Drop shadow under garment
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.25)';
-    ctx.shadowBlur = 16;
-    ctx.shadowOffsetY = 8;
+  /**
+   * Cut arm-shaped holes in the garment layer so arms appear in front.
+   * Arms are approximated as connected capsules: shoulder → elbow → wrist.
+   */
+  _drawArmMask(ctx, pose) {
+    const uw = pose.shoulderWidth * 0.14; // upper arm half-width
+    const fw = pose.shoulderWidth * 0.11; // forearm half-width
 
-    // Garment Body Silhouette Path
+    // Depth-aware: skip occlusion if joint is clearly behind the torso (Z > 0.05)
+    const isBehind = (p) => p && p.z > 0.05;
+
+    ctx.fillStyle = 'rgba(0,0,0,1)';
     ctx.beginPath();
-    // Neckline left
-    ctx.moveTo(-neckW / 2, -h * 0.22);
-    // Crewneck curve
-    ctx.quadraticCurveTo(0, -h * 0.12, neckW / 2, -h * 0.22);
-    // Right shoulder seam
-    ctx.lineTo(w / 2, -h * 0.18);
-    // Right sleeve outer
-    ctx.lineTo(w * 0.72, h * 0.18);
-    // Right sleeve inner armpit
-    ctx.lineTo(w * 0.46, h * 0.22);
-    // Right side body
-    ctx.lineTo(w * 0.44, h * 0.75);
-    // Bottom hem curve
-    ctx.quadraticCurveTo(0, h * 0.78, -w * 0.44, h * 0.75);
-    // Left side body
-    ctx.lineTo(-w * 0.46, h * 0.22);
-    // Left sleeve inner armpit
-    ctx.lineTo(-w * 0.72, h * 0.18);
-    // Left shoulder seam
-    ctx.lineTo(-w / 2, -h * 0.18);
+
+    // Left arm: shoulder → elbow
+    if (pose.leftShoulder && pose.leftElbow && !isBehind(pose.leftElbow)) {
+      this._capsulePath(ctx, pose.leftShoulder, pose.leftElbow, uw, uw);
+    }
+    // Left arm: elbow → wrist
+    if (pose.leftElbow && pose.leftWrist && !isBehind(pose.leftWrist) && !isBehind(pose.leftElbow)) {
+      this._capsulePath(ctx, pose.leftElbow, pose.leftWrist, uw, fw);
+    }
+    // Right arm: shoulder → elbow
+    if (pose.rightShoulder && pose.rightElbow && !isBehind(pose.rightElbow)) {
+      this._capsulePath(ctx, pose.rightShoulder, pose.rightElbow, uw, uw);
+    }
+    // Right arm: elbow → wrist
+    if (pose.rightElbow && pose.rightWrist && !isBehind(pose.rightWrist) && !isBehind(pose.rightElbow)) {
+      this._capsulePath(ctx, pose.rightElbow, pose.rightWrist, uw, fw);
+    }
+
+    ctx.fill();
+  }
+
+  _capsulePath(ctx, p1, p2, r1, r2) {
+    const dx = p2.x - p1.x, dy = p2.y - p1.y;
+    const len = Math.hypot(dx, dy);
+    if (len < 1) return;
+    const nx = -dy / len, ny = dx / len;
+    const a1 = Math.atan2(dy, dx);
+    ctx.moveTo(p1.x + nx * r1, p1.y + ny * r1);
+    ctx.lineTo(p2.x + nx * r2, p2.y + ny * r2);
+    ctx.arc(p2.x, p2.y, r2, a1 - Math.PI / 2, a1 + Math.PI / 2);
+    ctx.lineTo(p1.x - nx * r1, p1.y - ny * r1);
+    ctx.arc(p1.x, p1.y, r1, a1 + Math.PI / 2, a1 - Math.PI / 2);
+    ctx.closePath();
+  }
+
+  // ─── Tracking Outline ─────────────────────────────────────────────────────
+
+  /**
+   * Draw a confidence-coded glowing bounding outline around the garment region.
+   *
+   *  Green  (conf > 0.75) → solid tracking
+   *  Amber  (conf 0.45–0.75) → acceptable
+   *  Red    (conf < 0.45) → poor / barely locked on
+   */
+  _renderTrackingOutline(ctx, pose) {
+    const conf = pose.confidence ?? 0;
+    let color;
+    if (conf > 0.75)      color = 'rgba(16, 201, 130, 0.85)';  // vivid green
+    else if (conf > 0.45) color = 'rgba(251, 191, 36, 0.85)';  // amber
+    else                  color = 'rgba(248, 113, 113, 0.85)'; // soft red
+
+    const { leftShoulder: ls, rightShoulder: rs, leftHip: lh, rightHip: rh,
+            shoulderWidth: sw, torsoHeight: th, torsoAngle, chestCenter } = pose;
+
+    if (!ls || !rs || !lh || !rh || !chestCenter) return;
+
+    ctx.save();
+
+    // ── Shoulder / Hip anchor dots ────────────────────────────────────────────
+    ctx.shadowColor = color;
+    ctx.shadowBlur = 10;
+    ctx.fillStyle = color;
+    for (const pt of [ls, rs, lh, rh]) {
+      ctx.beginPath();
+      ctx.arc(pt.x, pt.y, 5, 0, Math.PI * 2);
+      ctx.fill();
+    }
+
+    // ── Torso bounding trapezoid (in garment-local space) ────────────────────
+    ctx.translate(chestCenter.x, chestCenter.y);
+    ctx.rotate(torsoAngle);
+
+    // Use the same torso clamp as the mesh deformer to keep outline matching
+    const clampedTh = Math.min(Math.max(th, sw * 1.0), sw * 1.8);
+
+    // Padding slightly wider than the widest garment (jacket ≈ 1.42×)
+    const halfW = sw * 0.76;
+    const top   = -clampedTh * 0.30;
+    const bot   =  clampedTh * 0.92;
+    const topW  =  halfW * 1.05;
+    const botW  =  halfW * 0.92;
+
+    ctx.beginPath();
+    ctx.moveTo(-topW, top);
+    ctx.lineTo( topW, top);
+    ctx.lineTo( botW, bot);
+    ctx.lineTo(-botW, bot);
     ctx.closePath();
 
-    // Fabric Fill Gradient
-    const grad = ctx.createLinearGradient(-w / 2, -h * 0.2, w / 2, h * 0.8);
-    grad.addColorStop(0, adjustColor(color, 20));
-    grad.addColorStop(0.5, color);
-    grad.addColorStop(1, adjustColor(color, -25));
-    ctx.fillStyle = grad;
-    ctx.fill();
-
-    // Collar detail
-    ctx.shadowColor = 'transparent';
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = adjustColor(color, -40);
-    ctx.stroke();
-
-    // Neck ribbing line
-    ctx.beginPath();
-    ctx.arc(0, -h * 0.22, neckW / 2, 0, Math.PI);
-    ctx.strokeStyle = 'rgba(255, 255, 255, 0.2)';
+    ctx.strokeStyle = color;
     ctx.lineWidth = 2;
+    ctx.setLineDash([8, 5]);
+    ctx.shadowBlur = 14;
     ctx.stroke();
 
-    // Brand Logo / Graphic Print on chest
-    ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
-    ctx.font = `800 ${Math.max(12, Math.round(w * 0.08))}px Outfit, sans-serif`;
+    // ── Corner tick marks ─────────────────────────────────────────────────────
+    ctx.setLineDash([]);
+    ctx.lineWidth = 3;
+    const tick = 14;
+    const corners = [
+      { x: -topW, y: top, dx: [1, 0],  dy: [0,  1] },
+      { x:  topW, y: top, dx: [-1, 0], dy: [0,  1] },
+      { x:  botW, y: bot, dx: [-1, 0], dy: [0, -1] },
+      { x: -botW, y: bot, dx: [1, 0],  dy: [0, -1] },
+    ];
+    for (const { x, y, dx, dy } of corners) {
+      ctx.beginPath();
+      ctx.moveTo(x, y); ctx.lineTo(x + dx[0] * tick, y + dx[1] * tick);
+      ctx.moveTo(x, y); ctx.lineTo(x + dy[0] * tick, y + dy[1] * tick);
+      ctx.stroke();
+    }
+
+    // ── TRACK XX% confidence pill (world-space, undo transform first) ─────────
+    ctx.rotate(-torsoAngle);
+    ctx.translate(-chestCenter.x, -chestCenter.y);
+
+    const pct   = Math.round(conf * 100);
+    const label = `TRACK ${pct}%`;
+    const lx    = (ls.x + rs.x) / 2;
+    const ly    = Math.min(ls.y, rs.y) - 18;
+
+    ctx.font = 'bold 11px monospace';
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
-    ctx.fillText(item.brand || 'VYBE', 0, h * 0.15);
-  }
 
-  renderOuterwear(ctx, center, shoulderW, torsoH, angle, color, item) {
-    ctx.translate(center.x, center.y);
-    ctx.rotate(angle);
-
-    const w = shoulderW * 1.28;
-    const h = torsoH * 1.22;
-
-    ctx.shadowColor = 'rgba(0, 0, 0, 0.35)';
-    ctx.shadowBlur = 20;
-
-    // Jacket outline
+    const tw = ctx.measureText(label).width + 14;
+    ctx.fillStyle = 'rgba(0,0,0,0.55)';
     ctx.beginPath();
-    ctx.moveTo(-w * 0.2, -h * 0.24);
-    ctx.lineTo(0, -h * 0.08); // V-neck lapel center
-    ctx.lineTo(w * 0.2, -h * 0.24);
-    ctx.lineTo(w * 0.52, -h * 0.18);
-    ctx.lineTo(w * 0.78, h * 0.45); // Right sleeve tip
-    ctx.lineTo(w * 0.52, h * 0.48);
-    ctx.lineTo(w * 0.48, h * 0.82);
-    ctx.lineTo(0, h * 0.84); // Bottom jacket center zipper split
-    ctx.lineTo(-w * 0.48, h * 0.82);
-    ctx.lineTo(-w * 0.52, h * 0.48);
-    ctx.lineTo(-w * 0.78, h * 0.45);
-    ctx.lineTo(-w * 0.52, -h * 0.18);
-    ctx.closePath();
-
-    const grad = ctx.createLinearGradient(-w / 2, 0, w / 2, 0);
-    grad.addColorStop(0, color);
-    grad.addColorStop(0.5, adjustColor(color, 25));
-    grad.addColorStop(1, color);
-    ctx.fillStyle = grad;
+    ctx.roundRect(lx - tw / 2, ly - 9, tw, 18, 5);
     ctx.fill();
 
-    ctx.shadowColor = 'transparent';
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = adjustColor(color, -50);
-    ctx.stroke();
+    ctx.fillStyle = color;
+    ctx.shadowBlur = 0;
+    ctx.fillText(label, lx, ly);
 
-    // Center Front Zipper Line
-    ctx.beginPath();
-    ctx.moveTo(0, -h * 0.08);
-    ctx.lineTo(0, h * 0.84);
-    ctx.lineWidth = 4;
-    ctx.strokeStyle = '#D4AF37'; // Brass zipper accent
-    ctx.stroke();
-
-    // Flap Chest Pockets
-    const pocketW = w * 0.16;
-    const pocketH = h * 0.14;
-    ctx.fillStyle = adjustColor(color, -20);
-    ctx.fillRect(-w * 0.3, h * 0.05, pocketW, pocketH);
-    ctx.fillRect(w * 0.3 - pocketW, h * 0.05, pocketW, pocketH);
+    ctx.restore();
   }
 
-  renderDress(ctx, center, shoulderW, torsoH, angle, color, item) {
-    ctx.translate(center.x, center.y);
-    ctx.rotate(angle);
+  // ─── Debug Skeleton ───────────────────────────────────────────────────────
 
-    const w = shoulderW * 1.05;
-    const h = torsoH * 2.3;
-
-    ctx.shadowColor = 'rgba(0,0,0,0.3)';
-    ctx.shadowBlur = 18;
-
-    ctx.beginPath();
-    // Spaghetti straps
-    ctx.moveTo(-w * 0.25, -h * 0.15);
-    ctx.lineTo(-w * 0.35, -h * 0.05);
-    ctx.lineTo(-w * 0.4, h * 0.2); // Waist flare
-    ctx.lineTo(-w * 0.75, h * 0.95); // Hem left flare
-    ctx.quadraticCurveTo(0, h, w * 0.75, h * 0.95); // Bottom hem
-    ctx.lineTo(w * 0.4, h * 0.2);
-    ctx.lineTo(w * 0.35, -h * 0.05);
-    ctx.lineTo(w * 0.25, -h * 0.15);
-    ctx.quadraticCurveTo(0, -h * 0.08, -w * 0.25, -h * 0.15);
-    ctx.closePath();
-
-    const grad = ctx.createLinearGradient(0, -h * 0.1, 0, h);
-    grad.addColorStop(0, adjustColor(color, 30));
-    grad.addColorStop(0.4, color);
-    grad.addColorStop(1, adjustColor(color, -30));
-    ctx.fillStyle = grad;
-    ctx.fill();
-  }
-
-  renderBottom(ctx, hipCenter, hipW, torsoH, angle, color, item) {
-    ctx.translate(hipCenter.x, hipCenter.y);
-    ctx.rotate(angle);
-
-    const w = hipW * 1.15;
-    const legLen = torsoH * 2.1;
-
-    ctx.shadowColor = 'rgba(0,0,0,0.25)';
-    ctx.shadowBlur = 14;
-
-    ctx.beginPath();
-    // Waistband
-    ctx.moveTo(-w * 0.5, 0);
-    ctx.lineTo(w * 0.5, 0);
-    // Right outer leg down
-    ctx.lineTo(w * 0.55, legLen);
-    // Right inner leg
-    ctx.lineTo(w * 0.08, legLen);
-    // Crotch junction
-    ctx.lineTo(0, legLen * 0.32);
-    // Left inner leg
-    ctx.lineTo(-w * 0.08, legLen);
-    // Left outer leg bottom
-    ctx.lineTo(-w * 0.55, legLen);
-    ctx.closePath();
-
-    const grad = ctx.createLinearGradient(-w / 2, 0, w / 2, legLen);
-    grad.addColorStop(0, color);
-    grad.addColorStop(0.5, adjustColor(color, 20));
-    grad.addColorStop(1, adjustColor(color, -20));
-    ctx.fillStyle = grad;
-    ctx.fill();
-
-    // Seam stitching & pockets
-    ctx.shadowColor = 'transparent';
-    ctx.lineWidth = 2;
-    ctx.strokeStyle = 'rgba(255,255,255,0.25)';
-    ctx.stroke();
-
-    // Fly seam line
-    ctx.beginPath();
-    ctx.moveTo(0, 0);
-    ctx.lineTo(0, legLen * 0.28);
-    ctx.strokeStyle = 'rgba(0,0,0,0.3)';
-    ctx.lineWidth = 3;
-    ctx.stroke();
-  }
-
-  renderSkeleton(ctx, pose) {
+  _renderDebugSkeleton(ctx, pose) {
     ctx.save();
-    ctx.lineWidth = 3;
-    ctx.strokeStyle = '#10B981';
-    ctx.fillStyle = '#10B981';
 
-    const pts = [
-      pose.leftShoulder, pose.rightShoulder,
-      pose.leftHip, pose.rightHip,
-      pose.leftElbow, pose.rightElbow,
-      pose.leftWrist, pose.rightWrist
+    const GREEN  = '#10B981';
+    const YELLOW = '#FBBF24';
+    const BLUE   = '#60A5FA';
+    const RED    = '#F87171';
+
+    // ── Bone connections ──────────────────────────────────────────────────────
+    const bones = [
+      ['leftShoulder', 'rightShoulder'],
+      ['leftShoulder', 'leftHip'],
+      ['rightShoulder', 'rightHip'],
+      ['leftHip', 'rightHip'],
+      ['leftShoulder', 'leftElbow'],
+      ['leftElbow', 'leftWrist'],
+      ['rightShoulder', 'rightElbow'],
+      ['rightElbow', 'rightWrist'],
+      ['leftHip', 'leftKnee'],
+      ['leftKnee', 'leftAnkle'],
+      ['rightHip', 'rightKnee'],
+      ['rightKnee', 'rightAnkle'],
     ];
 
-    pts.forEach(p => {
-      if (p) {
-        ctx.beginPath();
-        ctx.arc(p.x, p.y, 6, 0, Math.PI * 2);
-        ctx.fill();
-      }
-    });
+    ctx.lineWidth = 3;
+    for (const [a, b] of bones) {
+      const pA = pose[a], pB = pose[b];
+      if (!pA || !pB) continue;
+      const vis = ((pA.visibility ?? 1) + (pB.visibility ?? 1)) / 2;
+      // Color bones by confidence: green = high, yellow = mid, red = low
+      const hue = vis > 0.7 ? GREEN : vis > 0.4 ? YELLOW : RED;
+      ctx.strokeStyle = hue;
+      ctx.globalAlpha = Math.max(0.3, vis);
+      ctx.beginPath();
+      ctx.moveTo(pA.x, pA.y);
+      ctx.lineTo(pB.x, pB.y);
+      ctx.stroke();
+    }
+    ctx.globalAlpha = 1;
 
-    // Bone lines
+    // ── Shoulder line (dashed) ────────────────────────────────────────────────
+    ctx.setLineDash([6, 4]);
     if (pose.leftShoulder && pose.rightShoulder) {
+      ctx.strokeStyle = YELLOW; ctx.lineWidth = 2;
       ctx.beginPath();
       ctx.moveTo(pose.leftShoulder.x, pose.leftShoulder.y);
       ctx.lineTo(pose.rightShoulder.x, pose.rightShoulder.y);
       ctx.stroke();
     }
+    if (pose.leftHip && pose.rightHip) {
+      ctx.strokeStyle = BLUE; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.moveTo(pose.leftHip.x, pose.leftHip.y);
+      ctx.lineTo(pose.rightHip.x, pose.rightHip.y);
+      ctx.stroke();
+    }
+    ctx.setLineDash([]);
+
+    // ── Landmark dots with confidence-color coding ────────────────────────────
+    const pts = [
+      { k: 'leftShoulder',  l: 'LS', c: GREEN  },
+      { k: 'rightShoulder', l: 'RS', c: GREEN  },
+      { k: 'leftElbow',     l: 'LE', c: YELLOW },
+      { k: 'rightElbow',    l: 'RE', c: YELLOW },
+      { k: 'leftWrist',     l: 'LW', c: YELLOW },
+      { k: 'rightWrist',    l: 'RW', c: YELLOW },
+      { k: 'leftHip',       l: 'LH', c: BLUE   },
+      { k: 'rightHip',      l: 'RH', c: BLUE   },
+      { k: 'leftKnee',      l: 'LK', c: RED    },
+      { k: 'rightKnee',     l: 'RK', c: RED    },
+    ];
+
+    for (const { k, l, c } of pts) {
+      const pt = pose[k]; if (!pt) continue;
+      const conf = pt.visibility ?? 1;
+      ctx.globalAlpha = Math.max(0.3, conf);
+
+      // Outer ring
+      ctx.strokeStyle = c; ctx.lineWidth = 2;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 8, 0, Math.PI * 2); ctx.stroke();
+
+      // Inner dot
+      ctx.fillStyle = c;
+      ctx.beginPath(); ctx.arc(pt.x, pt.y, 4, 0, Math.PI * 2); ctx.fill();
+
+      // Label
+      ctx.globalAlpha = Math.max(0.5, conf);
+      ctx.fillStyle = 'rgba(255,255,255,0.9)';
+      ctx.font = 'bold 10px monospace';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'bottom';
+      ctx.fillText(l, pt.x, pt.y - 10);
+    }
+
+    ctx.globalAlpha = 1;
+
+    // ── Chest crosshair ───────────────────────────────────────────────────────
+    if (pose.chestCenter) {
+      const { x, y } = pose.chestCenter;
+      ctx.strokeStyle = 'rgba(255,42,95,0.95)'; ctx.lineWidth = 2;
+      const r = 10;
+      ctx.beginPath();
+      ctx.moveTo(x - r, y); ctx.lineTo(x + r, y);
+      ctx.moveTo(x, y - r); ctx.lineTo(x, y + r);
+      ctx.stroke();
+      // Confidence ring around chest
+      const conf = pose.confidence ?? 1;
+      const ringColor = conf > 0.6 ? GREEN : conf > 0.35 ? YELLOW : RED;
+      ctx.strokeStyle = ringColor; ctx.lineWidth = 2;
+      ctx.beginPath();
+      ctx.arc(x, y, 18, 0, Math.PI * 2 * conf);
+      ctx.stroke();
+    }
+
+    // ── Tracking state label ──────────────────────────────────────────────────
+    const state = pose.trackingState || 'TRACKING';
+    const stateColor = state === 'TRACKING' ? GREEN : state === 'TEMPORARILY_LOST' ? YELLOW : RED;
+    ctx.fillStyle = 'rgba(0,0,0,0.6)';
+    ctx.beginPath();
+    ctx.roundRect(8, 8, 160, 28, 6);
+    ctx.fill();
+    ctx.fillStyle = stateColor;
+    ctx.font = 'bold 12px monospace';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(`◉ ${state}`, 16, 22);
+
     ctx.restore();
   }
-}
 
-function shoulderWidthMultiplier(baseW, mult) {
-  return baseW * mult;
-}
+  // ─── Utilities ────────────────────────────────────────────────────────────
 
-function adjustColor(hex, amt) {
-  let usePound = false;
-  if (hex[0] === '#') {
-    hex = hex.slice(1);
-    usePound = true;
+  _ensureOffscreen(w, h) {
+    if (!this._offscreen) {
+      this._offscreen = document.createElement('canvas');
+      this._offCtx    = this._offscreen.getContext('2d');
+    }
+    if (this._offscreen.width !== w || this._offscreen.height !== h) {
+      this._offscreen.width  = w;
+      this._offscreen.height = h;
+    }
   }
-  if (hex.length === 3) {
-    hex = hex.split('').map(c => c + c).join('');
+
+  dispose() {
+    this._offscreen = null;
+    this._offCtx    = null;
+    this._imageCache.clear();
   }
-  let num = parseInt(hex, 16);
-  if (isNaN(num)) return '#1A1A1A';
-  let r = (num >> 16) + amt;
-  if (r > 255) r = 255; else if (r < 0) r = 0;
-  let b = ((num >> 8) & 0x00FF) + amt;
-  if (b > 255) b = 255; else if (b < 0) b = 0;
-  let g = (num & 0x0000FF) + amt;
-  if (g > 255) g = 255; else if (g < 0) g = 0;
-  return (usePound ? '#' : '') + (g | (b << 8) | (r << 16)).toString(16).padStart(6, '0');
 }
